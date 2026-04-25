@@ -9,14 +9,11 @@ use Laravel\Ai\Contracts\Providers\AudioProvider;
 use Laravel\Ai\Gateway\Concerns\HandlesFailoverErrors;
 use Laravel\Ai\Responses\AudioResponse;
 use Laravel\Ai\Responses\Data\Meta;
+use RuntimeException;
 
 class GeminiAudioGateway implements AudioGateway
 {
     use HandlesFailoverErrors;
-
-    public function __construct(
-        protected int $timeout = 120,
-    ) {}
 
     /**
      * Voice aliases mapping descriptive names to Gemini voice names.
@@ -36,8 +33,6 @@ class GeminiAudioGateway implements AudioGateway
 
     /**
      * Generate audio from the given text using Gemini TTS.
-     *
-     * @throws \RuntimeException
      */
     public function generateAudio(
         AudioProvider $provider,
@@ -45,39 +40,33 @@ class GeminiAudioGateway implements AudioGateway
         string $text,
         string $voice,
         ?string $instructions = null,
-        int $timeout = 30): AudioResponse
-    {
-        $apiKey = $provider->providerCredentials()['key'];
-
-        // Parse multi-speaker configuration from voice parameter
-        $speechConfig = $this->buildSpeechConfig($voice, $instructions);
+        int $timeout = 30,
+    ): AudioResponse {
+        $payloadText = $instructions ? "{$instructions}: {$text}" : $text;
 
         $response = $this->withErrorHandling($provider->name(), fn () => Http::withHeaders([
-            'Content-Type' => 'application/json',
-            'x-goog-api-key' => $apiKey,
-        ])->timeout($this->timeout)->post("https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent", [
-            'contents' => [
-                ['parts' => [['text' => $text]]],
+            'x-goog-api-key' => $provider->providerCredentials()['key'],
+        ])->timeout($timeout)->post(
+            "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent",
+            [
+                'contents' => [['parts' => [['text' => $payloadText]]]],
+                'generationConfig' => [
+                    'responseModalities' => ['AUDIO'],
+                    'speechConfig' => $this->buildSpeechConfig($voice),
+                ],
             ],
-            'generationConfig' => [
-                'responseModalities' => ['AUDIO'],
-                'speechConfig' => $speechConfig,
-            ],
-        ])->throw());
+        )->throw());
 
-        $responseData = $response->json();
+        $inlineData = $response->json('candidates.0.content.parts.0.inlineData');
 
-        // Extract audio data from response
-        $audioData = $responseData['candidates'][0]['content']['parts'][0]['inlineData']['data'] ?? null;
-
-        if (! $audioData) {
-            throw new \RuntimeException('No audio data received from Gemini API');
+        if (! $inlineData || empty($inlineData['data'])) {
+            throw new RuntimeException('No audio data received from Gemini API');
         }
 
         return new AudioResponse(
-            $audioData,
+            $inlineData['data'],
             new Meta($provider->name(), $model),
-            'audio/wav' // Gemini returns PCM/WAV format
+            $inlineData['mimeType'] ?? 'audio/L16;rate=24000',
         );
     }
 
@@ -86,15 +75,13 @@ class GeminiAudioGateway implements AudioGateway
      *
      * @return array<string, mixed>
      */
-    protected function buildSpeechConfig(string $voice, ?string $instructions): array
+    protected function buildSpeechConfig(string $voice): array
     {
-        // Check if voice contains multi-speaker configuration (JSON format)
         if ($this->isMultiSpeakerConfig($voice)) {
-            return $this->buildMultiSpeakerConfig($voice, $instructions);
+            return $this->buildMultiSpeakerConfig($voice);
         }
 
-        // Single speaker configuration
-        return $this->buildSingleSpeakerConfig($voice, $instructions);
+        return $this->buildSingleSpeakerConfig($voice);
     }
 
     /**
@@ -102,7 +89,9 @@ class GeminiAudioGateway implements AudioGateway
      */
     protected function isMultiSpeakerConfig(string $voice): bool
     {
-        return str_starts_with(trim($voice), '{') || str_starts_with(trim($voice), '[');
+        $trimmed = ltrim($voice);
+
+        return str_starts_with($trimmed, '{') || str_starts_with($trimmed, '[');
     }
 
     /**
@@ -110,22 +99,15 @@ class GeminiAudioGateway implements AudioGateway
      *
      * @return array<string, mixed>
      */
-    protected function buildSingleSpeakerConfig(string $voice, ?string $instructions): array
+    protected function buildSingleSpeakerConfig(string $voice): array
     {
-        $config = [
+        return [
             'voiceConfig' => [
                 'prebuiltVoiceConfig' => [
                     'voiceName' => $this->resolveVoiceName($voice),
                 ],
             ],
         ];
-
-        // Add instructions if provided
-        if ($instructions) {
-            $config['voiceConfig']['prebuiltVoiceConfig']['instructions'] = $instructions;
-        }
-
-        return $config;
     }
 
     /**
@@ -135,7 +117,7 @@ class GeminiAudioGateway implements AudioGateway
      *
      * @throws InvalidArgumentException
      */
-    protected function buildMultiSpeakerConfig(string $voice, ?string $instructions): array
+    protected function buildMultiSpeakerConfig(string $voice): array
     {
         $speakers = json_decode($voice, true);
 
@@ -143,46 +125,28 @@ class GeminiAudioGateway implements AudioGateway
             throw new InvalidArgumentException('Invalid JSON format for multi-speaker configuration');
         }
 
-        // Ensure we have an array of speakers
         if (! is_array($speakers)) {
             throw new InvalidArgumentException('Multi-speaker configuration must be an array');
         }
 
         $speakerConfigs = [];
 
-        foreach ($speakers as $speaker) {
-            $speakerName = $speaker['speaker'] ?? $speaker['name'] ?? 'Speaker'.(count($speakerConfigs) + 1);
-            $voiceName = $this->resolveVoiceName($speaker['voice'] ?? $speaker['voiceName'] ?? 'female');
-
-            $speakerConfig = [
-                'speaker' => $speakerName,
+        foreach ($speakers as $index => $speaker) {
+            $speakerConfigs[] = [
+                'speaker' => $speaker['speaker'] ?? $speaker['name'] ?? 'Speaker'.($index + 1),
                 'voiceConfig' => [
                     'prebuiltVoiceConfig' => [
-                        'voiceName' => $voiceName,
+                        'voiceName' => $this->resolveVoiceName($speaker['voice'] ?? $speaker['voiceName'] ?? 'female'),
                     ],
                 ],
             ];
-
-            // Add speaker-specific instructions if provided
-            if (isset($speaker['instructions'])) {
-                $speakerConfig['voiceConfig']['prebuiltVoiceConfig']['instructions'] = $speaker['instructions'];
-            }
-
-            $speakerConfigs[] = $speakerConfig;
         }
 
-        $config = [
+        return [
             'multiSpeakerVoiceConfig' => [
                 'speakerVoiceConfigs' => $speakerConfigs,
             ],
         ];
-
-        // Add global instructions if provided
-        if ($instructions) {
-            $config['multiSpeakerVoiceConfig']['instructions'] = $instructions;
-        }
-
-        return $config;
     }
 
     /**

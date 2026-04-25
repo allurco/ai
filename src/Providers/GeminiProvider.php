@@ -176,9 +176,7 @@ class GeminiProvider extends Provider implements AudioProvider, EmbeddingProvide
      */
     public function audioGateway(): AudioGateway
     {
-        return $this->audioGateway ??= new GeminiAudioGateway(
-            timeout: $this->config['audio']['timeout'] ?? 120,
-        );
+        return $this->audioGateway ??= new GeminiAudioGateway;
     }
 
     /**
